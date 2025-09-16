@@ -2,18 +2,24 @@ require('dotenv').config();
 const express = require('express');
 const morgan  = require('morgan');
 const path    = require('path');
+const { request } = require('undici');
 const { toE164BR, dedupeE164 } = require('./phone');
 
-const { request } = require('undici');
-const puppeteer   = require('puppeteer'); // <— busca manual (Google -> sites)
-const app  = express();
-const PORT = process.env.PORT || 5173;
+// Puppeteer + Stealth
+const puppeteer = require('puppeteer-extra');
+const StealthPlugin = require('puppeteer-extra-plugin-stealth');
+puppeteer.use(StealthPlugin());
 
-// --------- Middlewares básicos ----------
+// --------- Configs ----------
+const app = express();
+const PORT = process.env.PORT || 5173;
+const HEADLESS = String(process.env.HEADLESS || 'true') !== 'false';
+
+// --------- Middlewares ----------
 app.use(morgan('dev'));
 app.use(express.json({ limit: '1mb' }));
 
-// --------- CORS robusto + preflight ----------
+// CORS robusto + preflight
 const ALLOWED = (process.env.CORS_ORIGINS || 'https://smart-leads-front.vercel.app,http://localhost:5173')
   .split(',')
   .map(s => s.trim())
@@ -32,20 +38,201 @@ app.use((req, res, next) => {
   next();
 });
 
-// (Opcional) servir o front estático se estiver no mesmo app:
+// (Opcional) servir o front se estiver no mesmo app
 app.use(express.static(path.join(__dirname, '../../public')));
 
 app.get('/api/status', (_, res) => {
   res.json({
     ok: true,
     validationProvider: 'CLICK2CHAT',
-    searchMode: 'MANUAL (Google SERP + raspagem)'
+    searchMode: 'Puppeteer (Google) + fallback DuckDuckGo'
   });
 });
 
-/**
- * Valida números consultando a página pública de Click-to-Chat do WhatsApp (heurístico)
- */
+// --------- Utilitários de scraping ----------
+async function tryAcceptGoogleConsent(page) {
+  try {
+    const candidates = [
+      '#L2AGLb',
+      'button[aria-label="Aceitar tudo"]',
+      'button:has-text("Aceitar tudo")',
+      'button:has-text("Concordo")',
+      'button:has-text("Accept all")',
+      'button:has-text("I agree")'
+    ];
+    for (const sel of candidates) {
+      const btn = await page.$(sel);
+      if (btn) { await btn.click(); await page.waitForTimeout(500); break; }
+    }
+  } catch {}
+}
+
+async function extractPhonesFromPage(page) {
+  const telLinks = await page.$$eval('a[href^="tel:"]',
+    as => as.map(a => (a.getAttribute('href') || '').replace(/^tel:/i, ''))).catch(() => []);
+  const text = await page.evaluate(() => document.body ? document.body.innerText : '').catch(() => '');
+  const regex = /(\+?55\s*)?(\(?\d{2}\)?\s*)?(?:9?\d{4})[-.\s]?\d{4}/g;
+  const textPhones = Array.from((text || '').matchAll(regex)).map(m => m[0]);
+  return [...telLinks, ...textPhones];
+}
+
+async function humanGoogleSearch(browser, query, pagesToWalk = 2) {
+  const page = await browser.newPage();
+  await page.setViewport({ width: 1366, height: 768 });
+  await page.setUserAgent(
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) ' +
+    'Chrome/124.0 Safari/537.36'
+  );
+
+  await page.goto('https://www.google.com/?hl=pt-BR', { waitUntil: 'domcontentloaded', timeout: 60000 });
+  await tryAcceptGoogleConsent(page);
+
+  const inputSel = 'textarea[name="q"], input[name="q"]';
+  await page.waitForSelector(inputSel, { timeout: 15000 });
+  await page.click(inputSel);
+  for (const ch of query) {
+    await page.keyboard.type(ch, { delay: 50 + Math.floor(Math.random() * 80) });
+  }
+  await page.keyboard.press('Enter');
+
+  const links = [];
+  for (let p = 0; p < pagesToWalk; p++) {
+    await page.waitForTimeout(1500);
+
+    // Captura de links orgânicos em diferentes layouts
+    const urls = await page.$$eval('div.yuRUbf > a, a h3', els => {
+      const out = [];
+      for (const el of els) {
+        const a = el.tagName === 'A' ? el : el.closest('a');
+        if (a && a.href) out.push(a.href);
+      }
+      return Array.from(new Set(out));
+    }).catch(() => []);
+
+    for (const u of urls) {
+      try {
+        const host = new URL(u).hostname;
+        if (!/google\./i.test(host) && !/webcache|translate\.google/i.test(u)) {
+          links.push(u);
+        }
+      } catch {}
+    }
+    if (links.length >= 50) break;
+
+    const next = await page.$('a#pnnext, a[aria-label^="Próxima"], a[aria-label^="Next"]');
+    if (!next) break;
+    await Promise.all([
+      page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 60000 }),
+      next.click()
+    ]);
+  }
+
+  await page.close();
+  return Array.from(new Set(links)).slice(0, 50);
+}
+
+async function duckduckgoLinksHttp(query, maxLinks = 30) {
+  const url = `https://duckduckgo.com/html/?q=${encodeURIComponent(query)}&kl=br-pt&ia=web`;
+  const res = await request(url, {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36'
+    }
+  });
+  const html = await res.body.text();
+
+  // Extrai links da página HTML (sem API)
+  const links = Array.from(html.matchAll(/<a[^>]+class="[^"]*result__a[^"]*"[^>]+href="([^"]+)"/g))
+    .map(m => m[1])
+    .filter(Boolean);
+
+  const filtered = [];
+  for (const u of links) {
+    try {
+      const host = new URL(u).hostname;
+      if (!/duckduckgo\.com/i.test(host)) filtered.push(u);
+    } catch {}
+  }
+  return Array.from(new Set(filtered)).slice(0, maxLinks);
+}
+
+async function manualSearch({ city, segment, total }) {
+  const query = `${segment && segment.trim().length ? segment : 'empresas'} ${city} telefone`;
+  const max = Math.min(Number(total || 50), 200);
+
+  const browser = await puppeteer.launch({
+    headless: HEADLESS,
+    args: [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-gpu',
+      '--lang=pt-BR,pt'
+    ]
+  });
+
+  try {
+    // 1) Tenta Google (abrindo e digitando)
+    let links = [];
+    try {
+      links = await humanGoogleSearch(browser, query, 2);
+      console.log('[SCRAPER] Google links:', links.length);
+    } catch (e) {
+      console.log('[SCRAPER] Google falhou:', e.message || e);
+    }
+
+    // 2) Fallback DuckDuckGo (HTTP simples) se Google deu poucos links
+    if (links.length < 5) {
+      const ddg = await duckduckgoLinksHttp(query, 30);
+      console.log('[SCRAPER] DuckDuckGo links:', ddg.length);
+      links = Array.from(new Set([...links, ...ddg]));
+    }
+
+    // 3) Visita os sites e extrai telefones
+    const page = await browser.newPage();
+    const rawItems = [];
+    for (const url of links) {
+      try {
+        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
+        const title = await page.title().catch(() => '');
+        const phones = await extractPhonesFromPage(page);
+        rawItems.push({ url, title, phones });
+      } catch (e) {
+        // ignora site problemático
+      }
+      if (rawItems.length >= 60) break;
+      await page.waitForTimeout(250 + Math.floor(Math.random() * 250));
+    }
+    await page.close();
+
+    // 4) Normaliza p/ E.164 BR + deduplica
+    const enriched = [];
+    const seen = new Set();
+    for (const r of rawItems) {
+      for (const raw of r.phones) {
+        const e164 = toE164BR(raw);
+        if (!e164) continue;
+        if (seen.has(e164)) continue;
+        seen.add(e164);
+        enriched.push({
+          name: r.title || '',
+          phone_e164: e164,
+          address: '',
+          source: r.url
+        });
+        if (enriched.length >= max * 2) break;
+      }
+      if (enriched.length >= max * 2) break;
+    }
+
+    const uniquePhones = dedupeE164(enriched.map(e => e.phone_e164)).slice(0, max);
+    const set = new Set(uniquePhones);
+    return enriched.filter(e => set.has(e.phone_e164));
+  } finally {
+    await browser.close().catch(() => {});
+  }
+}
+
+// --------- Validação Click-to-Chat (heurística) ----------
 async function validateViaClickToChat(e164Numbers = []) {
   const out = [];
   for (const num of e164Numbers) {
@@ -72,138 +259,19 @@ async function validateViaClickToChat(e164Numbers = []) {
       status = 'unknown';
     }
     out.push({ input: num, status, wa_id: phone });
-    await new Promise(r => setTimeout(r, 300)); // ser gentil com o endpoint
+    await new Promise(r => setTimeout(r, 300));
   }
   return out;
 }
 
-/**
- * Busca manual: Google -> links orgânicos -> visita site -> extrai telefones
- */
-async function manualSearch({ city, segment, total }) {
-  const query = `${segment && segment.trim().length ? segment : 'empresas'} ${city} telefone`;
-  const maxLinks = Math.min((total || 50) * 5, 80);
-
-  const browser = await puppeteer.launch({
-    headless: 'new',
-    args: ['--no-sandbox', '--disable-setuid-sandbox']
-  });
-
-  const page = await browser.newPage();
-  await page.setUserAgent(
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) ' +
-    'Chrome/124.0 Safari/537.36'
-  );
-
-  const links = [];
-  let start = 0;
-
-  try {
-    while (links.length < maxLinks && start < 100) {
-      const url = `https://www.google.com/search?q=${encodeURIComponent(query)}&hl=pt-BR&num=10&start=${start}`;
-      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45000 });
-
-      // Pega links orgânicos a partir de /url?q=...
-      const urls = await page.$$eval('a[href^="https://www.google.com/url?"]', as => {
-        const ps = new URLSearchParams();
-        const out = [];
-        for (const a of as) {
-          try {
-            const href = new URL(a.href);
-            const q = href.searchParams.get('q');
-            if (q && /^https?:\/\//i.test(q)) out.push(q);
-          } catch {}
-        }
-        return Array.from(new Set(out));
-      });
-
-      for (const u of urls) {
-        if (links.length >= maxLinks) break;
-        // ignora domínios muito genéricos ou do próprio Google
-        if (/(google|gstatic)\./i.test(u)) continue;
-        links.push(u);
-      }
-      start += 10;
-    }
-
-    // Visita cada link e extrai telefones
-    const results = [];
-    const sub = await browser.newPage();
-    for (const url of links) {
-      try {
-        await sub.goto(url, { waitUntil: 'domcontentloaded', timeout: 45000 });
-        // 1) tel: links
-        const telLinks = await sub.$$eval('a[href^="tel:"]', as =>
-          as.map(a => (a.getAttribute('href') || '').replace(/^tel:/i, ''))
-        );
-        // 2) texto da página
-        const text = await sub.evaluate(() => document.body ? document.body.innerText : '');
-        const title = await sub.title();
-        const phoneCandidates = [
-          ...telLinks,
-          ...Array.from(
-            (text || '').matchAll(/(\+?55\s*)?(\(?\d{2}\)?\s*)?(?:9?\d{4})[-.\s]?\d{4}/g)
-          ).map(m => m[0])
-        ];
-
-        const normalized = [];
-        for (const raw of phoneCandidates) {
-          // envia para o servidor normalizar (BR E.164)
-          // vamos só empurrar agora; a limpeza real será feita depois com toE164BR
-          normalized.push(raw);
-        }
-
-        const domain = (() => { try { return new URL(url).hostname; } catch { return url; } })();
-        results.push({
-          url,
-          title: title || domain,
-          rawPhones: normalized
-        });
-      } catch {
-        // ignora erros de site individual
-      }
-      if (results.length >= maxLinks) break;
-    }
-
-    // Normalizar + deduplicar
-    const enriched = [];
-    const seen = new Set();
-    for (const r of results) {
-      for (const raw of r.rawPhones) {
-        const e164 = toE164BR(raw);
-        if (!e164) continue;
-        if (seen.has(e164)) continue;
-        seen.add(e164);
-        enriched.push({
-          name: r.title || '',
-          phone_e164: e164,
-          address: '',
-          source: r.url
-        });
-        if (enriched.length >= (total || 50) * 2) break;
-      }
-      if (enriched.length >= (total || 50) * 2) break;
-    }
-
-    // Deduplica final e corta no total
-    const uniquePhones = dedupeE164(enriched.map(e => e.phone_e164)).slice(0, total || 50);
-    const uniqueSet = new Set(uniquePhones);
-    const compact = enriched.filter(e => uniqueSet.has(e.phone_e164));
-
-    return compact;
-  } finally {
-    await browser.close();
-  }
-}
-
-// --------- ENDPOINT: validar CSV/Manual (Click-to-Chat) ----------
+// --------- Endpoints ----------
 app.post('/api/validate', async (req, res) => {
   try {
     const { numbers } = req.body || {};
     if (!Array.isArray(numbers) || numbers.length === 0) {
       return res.status(400).json({ error: 'Envie um array "numbers".' });
     }
-    const rawList = numbers.map(n => (n ?? '').toString().trim()).filter(Boolean);
+    const rawList  = numbers.map(n => (n ?? '').toString().trim()).filter(Boolean);
     const mappings = rawList.map(raw => ({ raw, e164: toE164BR(raw) }));
     const e164Unique = [...new Set(mappings.map(m => m.e164).filter(Boolean))];
     const validation = await validateViaClickToChat(e164Unique);
@@ -221,7 +289,6 @@ app.post('/api/validate', async (req, res) => {
   }
 });
 
-// --------- ENDPOINT: run (busca manual + validação Click-to-Chat) ----------
 app.post('/api/run', async (req, res) => {
   try {
     const { city, segment, total } = req.body || {};
@@ -232,8 +299,9 @@ app.post('/api/run', async (req, res) => {
 
     // 1) Buscar manualmente
     const compact = await manualSearch({ city, segment, total: max });
+    console.log('[SCRAPER] telefones encontrados (pré-validação):', compact.length);
 
-    // 2) Validar via Click-to-Chat (heurístico)
+    // 2) Validar via Click-to-Chat
     const validation = await validateViaClickToChat(compact.map(e => e.phone_e164));
     const by = new Map(validation.map(v => [v.input, v.status]));
 
