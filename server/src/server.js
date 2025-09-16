@@ -5,25 +5,22 @@ const path    = require('path');
 const { request } = require('undici');
 const { toE164BR, dedupeE164 } = require('./phone');
 
-// Puppeteer + Stealth
+// Puppeteer + Stealth (para reduzir bloqueio)
 const puppeteer = require('puppeteer-extra');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 puppeteer.use(StealthPlugin());
 
-// --------- Configs ----------
 const app = express();
 const PORT = process.env.PORT || 5173;
 const HEADLESS = String(process.env.HEADLESS || 'true') !== 'false';
 
-// --------- Middlewares ----------
+// ---------- Middlewares ----------
 app.use(morgan('dev'));
 app.use(express.json({ limit: '1mb' }));
 
 // CORS robusto + preflight
 const ALLOWED = (process.env.CORS_ORIGINS || 'https://smart-leads-front.vercel.app,http://localhost:5173')
-  .split(',')
-  .map(s => s.trim())
-  .filter(Boolean);
+  .split(',').map(s => s.trim()).filter(Boolean);
 
 app.use((req, res, next) => {
   const origin = req.headers.origin;
@@ -38,18 +35,18 @@ app.use((req, res, next) => {
   next();
 });
 
-// (Opcional) servir o front se estiver no mesmo app
+// (Opcional) servir front estático
 app.use(express.static(path.join(__dirname, '../../public')));
 
 app.get('/api/status', (_, res) => {
   res.json({
     ok: true,
-    validationProvider: 'CLICK2CHAT',
+    validationProvider: 'CLICK2CHAT (on-demand)',
     searchMode: 'Puppeteer (Google) + fallback DuckDuckGo'
   });
 });
 
-// --------- Utilitários de scraping ----------
+// ---------- Utilitários ----------
 async function tryAcceptGoogleConsent(page) {
   try {
     const candidates = [
@@ -99,7 +96,6 @@ async function humanGoogleSearch(browser, query, pagesToWalk = 2) {
   for (let p = 0; p < pagesToWalk; p++) {
     await page.waitForTimeout(1500);
 
-    // Captura de links orgânicos em diferentes layouts
     const urls = await page.$$eval('div.yuRUbf > a, a h3', els => {
       const out = [];
       for (const el of els) {
@@ -139,8 +135,6 @@ async function duckduckgoLinksHttp(query, maxLinks = 30) {
     }
   });
   const html = await res.body.text();
-
-  // Extrai links da página HTML (sem API)
   const links = Array.from(html.matchAll(/<a[^>]+class="[^"]*result__a[^"]*"[^>]+href="([^"]+)"/g))
     .map(m => m[1])
     .filter(Boolean);
@@ -171,7 +165,7 @@ async function manualSearch({ city, segment, total }) {
   });
 
   try {
-    // 1) Tenta Google (abrindo e digitando)
+    // 1) Google (abre e digita)
     let links = [];
     try {
       links = await humanGoogleSearch(browser, query, 2);
@@ -180,14 +174,14 @@ async function manualSearch({ city, segment, total }) {
       console.log('[SCRAPER] Google falhou:', e.message || e);
     }
 
-    // 2) Fallback DuckDuckGo (HTTP simples) se Google deu poucos links
+    // 2) Fallback DuckDuckGo
     if (links.length < 5) {
       const ddg = await duckduckgoLinksHttp(query, 30);
       console.log('[SCRAPER] DuckDuckGo links:', ddg.length);
       links = Array.from(new Set([...links, ...ddg]));
     }
 
-    // 3) Visita os sites e extrai telefones
+    // 3) Visitar sites e extrair telefones
     const page = await browser.newPage();
     const rawItems = [];
     for (const url of links) {
@@ -196,15 +190,13 @@ async function manualSearch({ city, segment, total }) {
         const title = await page.title().catch(() => '');
         const phones = await extractPhonesFromPage(page);
         rawItems.push({ url, title, phones });
-      } catch (e) {
-        // ignora site problemático
-      }
+      } catch {}
       if (rawItems.length >= 60) break;
       await page.waitForTimeout(250 + Math.floor(Math.random() * 250));
     }
     await page.close();
 
-    // 4) Normaliza p/ E.164 BR + deduplica
+    // 4) Normalizar + deduplicar (E.164 BR)
     const enriched = [];
     const seen = new Set();
     for (const r of rawItems) {
@@ -217,7 +209,8 @@ async function manualSearch({ city, segment, total }) {
           name: r.title || '',
           phone_e164: e164,
           address: '',
-          source: r.url
+          source: r.url,
+          wa_status: 'unvalidated' // <- NÃO validamos aqui
         });
         if (enriched.length >= max * 2) break;
       }
@@ -232,7 +225,7 @@ async function manualSearch({ city, segment, total }) {
   }
 }
 
-// --------- Validação Click-to-Chat (heurística) ----------
+// Validação Click-to-Chat (on-demand)
 async function validateViaClickToChat(e164Numbers = []) {
   const out = [];
   for (const num of e164Numbers) {
@@ -297,34 +290,25 @@ app.post('/api/run', async (req, res) => {
     }
     const max = Math.min(Number(total || 50), 200);
 
-    // 1) Buscar manualmente
+    // 1) Buscar manualmente (sem validar)
     const compact = await manualSearch({ city, segment, total: max });
-    console.log('[SCRAPER] telefones encontrados (pré-validação):', compact.length);
+    console.log('[SCRAPER] contatos (sem validação):', compact.length);
 
-    // 2) Validar via Click-to-Chat
-    const validation = await validateViaClickToChat(compact.map(e => e.phone_e164));
-    const by = new Map(validation.map(v => [v.input, v.status]));
-
-    const finalRows = compact.map(e => ({
-      name: e.name,
-      phone_e164: e.phone_e164,
-      wa_status: by.get(e.phone_e164) || 'unknown',
-      address: e.address,
-      source: e.source
-    }));
-
-    // 3) CSV
+    // 2) CSV (sem validação: wa_status = unvalidated)
     const csvHeader = 'name,phone_e164,wa_status,address,source\n';
-    const csvBody = finalRows.map(r => [
-      csvEscape(r.name),
-      csvEscape(r.phone_e164),
-      csvEscape(r.wa_status),
-      csvEscape(r.address),
-      csvEscape(r.source)
+    const csvBody = compact.map(r => [
+      csvEscape(r.name), csvEscape(r.phone_e164), 'unvalidated',
+      csvEscape(r.address), csvEscape(r.source)
     ].join(',')).join('\n');
     const csv = csvHeader + csvBody + '\n';
 
-    res.json({ ok: true, query: `${segment || 'empresas'} ${city}`, total: finalRows.length, rows: finalRows, csv });
+    res.json({
+      ok: true,
+      query: `${segment || 'empresas'} ${city}`,
+      total: compact.length,
+      rows: compact, // wa_status já vem 'unvalidated'
+      csv
+    });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: err.message || String(err) });
