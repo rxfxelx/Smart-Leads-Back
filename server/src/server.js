@@ -5,7 +5,7 @@ const path    = require('path');
 const { request } = require('undici');
 const { toE164BR, dedupeE164 } = require('./phone');
 
-// Puppeteer + Stealth (para reduzir bloqueio)
+// Puppeteer + Stealth (reduz bloqueio)
 const puppeteer = require('puppeteer-extra');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 puppeteer.use(StealthPlugin());
@@ -14,39 +14,55 @@ const app = express();
 const PORT = process.env.PORT || 5173;
 const HEADLESS = String(process.env.HEADLESS || 'true') !== 'false';
 
-// ---------- Middlewares ----------
+/* ---------- Middlewares ---------- */
 app.use(morgan('dev'));
 app.use(express.json({ limit: '1mb' }));
 
-// CORS robusto + preflight
+/* ---------- CORS robusto + preflight ---------- */
+// Em produção, configure CORS_ORIGINS= https://SEU-FRONT ,...   | para teste rápido: CORS_ANY=1
 const ALLOWED = (process.env.CORS_ORIGINS || 'https://smart-leads-front.vercel.app,http://localhost:5173')
   .split(',').map(s => s.trim()).filter(Boolean);
 
 app.use((req, res, next) => {
   const origin = req.headers.origin;
-  if (origin && (ALLOWED.includes(origin) || process.env.CORS_ANY === '1')) {
-    res.setHeader('Access-Control-Allow-Origin', process.env.CORS_ANY === '1' ? '*' : origin);
+  const allowAny = process.env.CORS_ANY === '1';
+
+  if (allowAny) {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+  } else if (origin && ALLOWED.includes(origin)) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+  } else if (origin) {
+    // fallback seguro (para debug). Remova depois.
+    res.setHeader('Access-Control-Allow-Origin', origin);
   }
+
   res.setHeader('Vary', 'Origin');
   res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With');
   res.setHeader('Access-Control-Max-Age', '86400');
+
   if (req.method === 'OPTIONS') return res.sendStatus(204);
   next();
 });
 
-// (Opcional) servir front estático
+/* (Opcional) servir front estático (se o front estiver neste mesmo projeto) */
 app.use(express.static(path.join(__dirname, '../../public')));
 
+/* ---------- Health ---------- */
+app.get('/', (_, res) => res.type('text/plain').send('OK'));
+app.get('/healthz', (_, res) => res.json({ ok: true, ts: Date.now() }));
+
+/* ---------- Status ---------- */
 app.get('/api/status', (_, res) => {
   res.json({
     ok: true,
     validationProvider: 'CLICK2CHAT (on-demand)',
-    searchMode: 'Puppeteer (Google) + fallback DuckDuckGo'
+    searchMode: 'Puppeteer (Google) + fallback DuckDuckGo',
+    ts: Date.now()
   });
 });
 
-// ---------- Utilitários ----------
+/* ---------- Utilitários de scraping ---------- */
 async function tryAcceptGoogleConsent(page) {
   try {
     const candidates = [
@@ -87,9 +103,7 @@ async function humanGoogleSearch(browser, query, pagesToWalk = 2) {
   const inputSel = 'textarea[name="q"], input[name="q"]';
   await page.waitForSelector(inputSel, { timeout: 15000 });
   await page.click(inputSel);
-  for (const ch of query) {
-    await page.keyboard.type(ch, { delay: 50 + Math.floor(Math.random() * 80) });
-  }
+  for (const ch of query) await page.keyboard.type(ch, { delay: 50 + Math.floor(Math.random() * 80) });
   await page.keyboard.press('Enter');
 
   const links = [];
@@ -108,9 +122,7 @@ async function humanGoogleSearch(browser, query, pagesToWalk = 2) {
     for (const u of urls) {
       try {
         const host = new URL(u).hostname;
-        if (!/google\./i.test(host) && !/webcache|translate\.google/i.test(u)) {
-          links.push(u);
-        }
+        if (!/google\./i.test(host) && !/webcache|translate\.google/i.test(u)) links.push(u);
       } catch {}
     }
     if (links.length >= 50) break;
@@ -210,7 +222,7 @@ async function manualSearch({ city, segment, total }) {
           phone_e164: e164,
           address: '',
           source: r.url,
-          wa_status: 'unvalidated' // <- NÃO validamos aqui
+          wa_status: 'unvalidated' // NÃO validamos aqui
         });
         if (enriched.length >= max * 2) break;
       }
@@ -225,7 +237,7 @@ async function manualSearch({ city, segment, total }) {
   }
 }
 
-// Validação Click-to-Chat (on-demand)
+/* ---------- Validação Click-to-Chat (on-demand) ---------- */
 async function validateViaClickToChat(e164Numbers = []) {
   const out = [];
   for (const num of e164Numbers) {
@@ -257,7 +269,7 @@ async function validateViaClickToChat(e164Numbers = []) {
   return out;
 }
 
-// --------- Endpoints ----------
+/* ---------- Endpoints ---------- */
 app.post('/api/validate', async (req, res) => {
   try {
     const { numbers } = req.body || {};
@@ -290,11 +302,10 @@ app.post('/api/run', async (req, res) => {
     }
     const max = Math.min(Number(total || 50), 200);
 
-    // 1) Buscar manualmente (sem validar)
     const compact = await manualSearch({ city, segment, total: max });
     console.log('[SCRAPER] contatos (sem validação):', compact.length);
 
-    // 2) CSV (sem validação: wa_status = unvalidated)
+    // CSV (sem validação: wa_status = unvalidated)
     const csvHeader = 'name,phone_e164,wa_status,address,source\n';
     const csvBody = compact.map(r => [
       csvEscape(r.name), csvEscape(r.phone_e164), 'unvalidated',
@@ -306,7 +317,7 @@ app.post('/api/run', async (req, res) => {
       ok: true,
       query: `${segment || 'empresas'} ${city}`,
       total: compact.length,
-      rows: compact, // wa_status já vem 'unvalidated'
+      rows: compact,
       csv
     });
   } catch (err) {
