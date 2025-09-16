@@ -14,23 +14,25 @@ const app = express();
 const PORT = process.env.PORT || 5173;
 const HEADLESS = String(process.env.HEADLESS || 'true') !== 'false';
 
-/* ---------- Middlewares ---------- */
+// ---- helpers ----
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+// ---------- Middlewares ----------
 app.use(morgan('dev'));
 app.use(express.json({ limit: '1mb' }));
 
-/* ---------- CORS ---------- */
+// CORS (liberado p/ teste; ajuste CORS_ORIGINS em produção)
 const ALLOWED = (process.env.CORS_ORIGINS || 'https://smart-leads-front.vercel.app,http://localhost:5173')
   .split(',').map(s => s.trim()).filter(Boolean);
 
 app.use((req, res, next) => {
   const origin = req.headers.origin;
-  const allowAny = process.env.CORS_ANY === '1';
-  if (allowAny) {
+  if (process.env.CORS_ANY === '1') {
     res.setHeader('Access-Control-Allow-Origin', '*');
   } else if (origin && ALLOWED.includes(origin)) {
     res.setHeader('Access-Control-Allow-Origin', origin);
   } else if (origin) {
-    // fallback de debug — remova em prod se quiser estrito
+    // fallback de debug
     res.setHeader('Access-Control-Allow-Origin', origin);
   }
   res.setHeader('Vary', 'Origin');
@@ -41,39 +43,38 @@ app.use((req, res, next) => {
   next();
 });
 
-/* ---------- Static / Health ---------- */
+// Static + health
 app.use(express.static(path.join(__dirname, '../../public')));
 app.get('/', (_, res) => res.type('text/plain').send('OK'));
 app.get('/healthz', (_, res) => res.json({ ok: true, ts: Date.now() }));
 
+// Status
 app.get('/api/status', (_, res) => {
   res.json({
     ok: true,
     validationProvider: 'CLICK2CHAT (on-demand)',
-    searchMode: 'Puppeteer (Google) + fallback DuckDuckGo (decoded)',
+    searchMode: 'Puppeteer (Google) + DDG (decoded) + Bing fallback',
     ts: Date.now()
   });
 });
 
-/* ---------- Scraper utils ---------- */
+// ---------- Scraper utils ----------
 async function tryAcceptGoogleConsent(page) {
   try {
-    const selectors = [
-      '#L2AGLb',
-      'button[aria-label="Aceitar tudo"]',
-      'button:has-text("Aceitar tudo")',
-      'button:has-text("Concordo")',
-      'button:has-text("Accept all")',
-      'button:has-text("I agree")'
-    ];
-    for (const sel of selectors) {
-      const btn = await page.$(sel);
-      if (btn) { await btn.click(); await page.waitForTimeout(500); break; }
-    }
+    // tenta botões comuns com querySelector
+    const clicked = await page.evaluate(() => {
+      const labels = /Aceitar tudo|Concordo|Accept all|I agree/i;
+      const btn = [...document.querySelectorAll('button')].find(b => labels.test(b.textContent || ''));
+      if (btn) { btn.click(); return true; }
+      const l2 = document.querySelector('#L2AGLb');
+      if (l2) { l2.click(); return true; }
+      return false;
+    });
+    if (clicked) await sleep(500);
   } catch {}
 }
 
-// NOVO: também captura números em links do WhatsApp (wa.me / api.whatsapp.com)
+// também captura números em links do WhatsApp (wa.me / api.whatsapp.com)
 async function extractPhonesFromPage(page) {
   const telLinks = await page.$$eval('a[href^="tel:"]',
     as => as.map(a => (a.getAttribute('href') || '').replace(/^tel:/i, ''))).catch(() => []);
@@ -107,14 +108,14 @@ async function humanGoogleSearch(browser, query, pagesToWalk = 2) {
   await tryAcceptGoogleConsent(page);
 
   const inputSel = 'textarea[name="q"], input[name="q"]';
-  await page.waitForSelector(inputSel, { timeout: 15000 });
-  await page.click(inputSel);
-  for (const ch of query) await page.keyboard.type(ch, { delay: 50 + Math.floor(Math.random() * 80) });
+  await page.waitForSelector(inputSel, { timeout: 15000 }).catch(() => {});
+  await page.click(inputSel).catch(() => {});
+  for (const ch of query) { await page.keyboard.type(ch, { delay: 50 + Math.floor(Math.random() * 80) }); }
   await page.keyboard.press('Enter');
 
   const links = [];
   for (let p = 0; p < pagesToWalk; p++) {
-    await page.waitForTimeout(1500);
+    await sleep(1500);
 
     const urls = await page.$$eval('div.yuRUbf > a, a h3', els => {
       const out = [];
@@ -136,18 +137,19 @@ async function humanGoogleSearch(browser, query, pagesToWalk = 2) {
     const next = await page.$('a#pnnext, a[aria-label^="Próxima"], a[aria-label^="Next"]');
     if (!next) break;
     await Promise.all([
-      page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 60000 }),
+      page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 60000 }).catch(() => {}),
       next.click()
     ]);
   }
 
-  await page.close();
+  await page.close().catch(() => {});
   return Array.from(new Set(links)).slice(0, 50);
 }
 
-// NOVO: decodifica links do DDG (pega o parâmetro uddg)
+// decodifica /l/?uddg= do DDG
 function decodeDuckLink(href) {
   try {
+    if (href.startsWith('/l/')) href = 'https://duckduckgo.com' + href;
     const u = new URL(href);
     if (/duckduckgo\.com/i.test(u.hostname)) {
       const real = u.searchParams.get('uddg');
@@ -166,24 +168,45 @@ async function duckduckgoLinksHttp(query, maxLinks = 30) {
   });
   const html = await res.body.text();
 
-  const raw = Array.from(html.matchAll(/<a[^>]+class="[^"]*result__a[^"]*"[^>]+href="([^"]+)"/g))
-    .map(m => m[1])
-    .filter(Boolean);
+  // pega anchors gerais (inclui result__a e /l/?)
+  const rawHrefs = Array.from(html.matchAll(/<a[^>]+href="([^"]+)"/gi)).map(m => m[1]);
 
   const out = [];
-  for (const href of raw) {
+  for (let href of rawHrefs) {
+    if (!/duckduckgo\.com/i.test(href) && !href.startsWith('/l/')) continue; // mantemos só os que precisam decode
     const decoded = decodeDuckLink(href);
     try {
       const host = new URL(decoded).hostname;
       if (!/duckduckgo\.com/i.test(host)) out.push(decoded);
     } catch {}
+    if (out.length >= maxLinks) break;
   }
   return Array.from(new Set(out)).slice(0, maxLinks);
 }
 
-/* ---------- Busca principal (sem validação) ---------- */
+// Bing (HTML) fallback simples
+async function bingLinksHttp(query, maxLinks = 25) {
+  const url = `https://www.bing.com/search?q=${encodeURIComponent(query)}&setlang=pt-BR`;
+  const res = await request(url, {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36'
+    }
+  });
+  const html = await res.body.text();
+  const hrefs = Array.from(html.matchAll(/<h2[^>]*>\s*<a[^>]+href="([^"]+)"/gi)).map(m => m[1]);
+  const filtered = [];
+  for (const u of hrefs) {
+    try {
+      const host = new URL(u).hostname;
+      if (!/bing\.com/i.test(host)) filtered.push(u);
+    } catch {}
+    if (filtered.length >= maxLinks) break;
+  }
+  return Array.from(new Set(filtered));
+}
+
+// ---------- Busca principal (sem validação) ----------
 async function manualSearch({ city, segment, total }) {
-  // duas variações de consulta aumentam chance de achar telefone
   const queries = [
     `${segment && segment.trim().length ? segment : 'empresas'} ${city} telefone`,
     `${segment && segment.trim().length ? segment : 'empresas'} ${city} contato`
@@ -204,7 +227,7 @@ async function manualSearch({ city, segment, total }) {
   try {
     const allLinks = new Set();
 
-    // 1) Google (abre e digita)
+    // Google
     for (const q of queries) {
       try {
         const gl = await humanGoogleSearch(browser, q, 2);
@@ -215,7 +238,7 @@ async function manualSearch({ city, segment, total }) {
     }
     console.log('[SCRAPER] Google total links:', allLinks.size);
 
-    // 2) Fallback DuckDuckGo (HTML) — agora decodificado
+    // DuckDuckGo (HTML)
     if (allLinks.size < 8) {
       for (const q of queries) {
         const ddg = await duckduckgoLinksHttp(q, 30);
@@ -224,7 +247,16 @@ async function manualSearch({ city, segment, total }) {
       console.log('[SCRAPER] DuckDuckGo total links (após merge):', allLinks.size);
     }
 
-    // 3) Visitar sites e extrair telefones
+    // Bing (HTML)
+    if (allLinks.size < 8) {
+      for (const q of queries) {
+        const bl = await bingLinksHttp(q, 25);
+        bl.forEach(u => allLinks.add(u));
+      }
+      console.log('[SCRAPER] Bing total links (após merge):', allLinks.size);
+    }
+
+    // Visitar sites e extrair telefones
     const page = await browser.newPage();
     const rawItems = [];
     for (const url of Array.from(allLinks)) {
@@ -235,11 +267,11 @@ async function manualSearch({ city, segment, total }) {
         if (phones.length) rawItems.push({ url, title, phones });
       } catch {}
       if (rawItems.length >= 80) break;
-      await page.waitForTimeout(250 + Math.floor(Math.random() * 250));
+      await sleep(250 + Math.floor(Math.random() * 250));
     }
-    await page.close();
+    await page.close().catch(() => {});
 
-    // 4) Normalizar + deduplicar (E.164 BR)
+    // Normalizar + deduplicar
     const enriched = [];
     const seen = new Set();
     for (const r of rawItems) {
@@ -252,7 +284,7 @@ async function manualSearch({ city, segment, total }) {
           phone_e164: e164,
           address: '',
           source: r.url,
-          wa_status: 'unvalidated' // NÃO validamos aqui
+          wa_status: 'unvalidated'
         });
         if (enriched.length >= max * 2) break;
       }
@@ -269,7 +301,7 @@ async function manualSearch({ city, segment, total }) {
   }
 }
 
-/* ---------- Validação (on‑demand) ---------- */
+// ---------- Validação (on‑demand) ----------
 async function validateViaClickToChat(e164Numbers = []) {
   const out = [];
   for (const num of e164Numbers) {
@@ -295,12 +327,12 @@ async function validateViaClickToChat(e164Numbers = []) {
       status = 'unknown';
     }
     out.push({ input: num, status, wa_id: phone });
-    await new Promise(r => setTimeout(r, 250));
+    await sleep(250);
   }
   return out;
 }
 
-/* ---------- Endpoints ---------- */
+// ---------- Endpoints ----------
 app.post('/api/validate', async (req, res) => {
   try {
     const { numbers } = req.body || {};
