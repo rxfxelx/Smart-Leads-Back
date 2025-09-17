@@ -14,7 +14,7 @@ PHONE_RE = re.compile(r"(\+?55\s*)?(\(?\d{2}\)?\s*)?(?:9?\d{4})[-.\s]?\d{4}")
 def to_e164_br(raw: str) -> str | None:
     s = re.sub(r"[^\d+]", "", raw or "")
     for cand in (s, "+55"+s if not s.startswith("+") else None):
-        if not cand: 
+        if not cand:
             continue
         try:
             n = pn.parse(cand, "BR")
@@ -41,18 +41,28 @@ async def extract_phones_from_html(html: str) -> list[str]:
     for m in re.finditer(r'href=["\']tel:([^"\']+)["\']', html, flags=re.I):
         e = to_e164_br(m.group(1))
         if e: out.add(e)
-    # wa.me e api.whatsapp.com
+    # wa.me
     for m in re.finditer(r'wa\.me/(\d{10,15})', html, flags=re.I):
-        raw = m.group(1); e = to_e164_br("+"+raw if raw.startswith("55") else "+55"+raw)
+        raw = m.group(1)
+        e = to_e164_br("+"+raw if raw.startswith("55") else "+55"+raw)
         if e: out.add(e)
+    # api.whatsapp.com
     for m in re.finditer(r'api\.whatsapp\.com/[^"\']*?[?&]phone=(\d{10,15})', html, flags=re.I):
-        raw = m.group(1); e = to_e164_br("+"+raw if raw.startswith("55") else "+55"+raw)
+        raw = m.group(1)
+        e = to_e164_br("+"+raw if raw.startswith("55") else "+55"+raw)
         if e: out.add(e)
     # texto
     for m in PHONE_RE.finditer(html):
         e = to_e164_br(m.group(0))
         if e: out.add(e)
     return sorted(out)
+
+def csv_escape(val: str) -> str:
+    """Escapa adequadamente para CSV (aspas duplas, vírgula e quebras de linha)."""
+    s = (val or "")
+    if any(ch in s for ch in [',', '"', '\n']):
+        s = '"' + s.replace('"', '""') + '"'
+    return s
 
 async def search_and_collect(city: str, segment: str, total: int, headless: bool = True) -> dict:
     query_base = f"{segment or 'empresas'} {city}"
@@ -62,29 +72,44 @@ async def search_and_collect(city: str, segment: str, total: int, headless: bool
     max_links = max(20, min(total * 5, 80))
 
     async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=headless, args=["--no-sandbox","--disable-gpu"])
+        # FLAGS importantes para Railway:
+        #  - no sandbox (roda como root)
+        #  - não usa /dev/shm (pequeno em container)
+        #  - desativa GPU
+        browser = await pw.chromium.launch(
+            headless=headless,
+            args=[
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu"
+            ]
+        )
         context = await browser.new_context(user_agent=UA, locale="pt-BR")
         page = await context.new_page()
 
-        # Preferir DuckDuckGo (menos bloqueio); se desejar troque por Google
-        links = []
+        # Buscar links no DuckDuckGo
+        links: list[str] = []
         for q in queries:
             await page.goto("https://duckduckgo.com/?ia=web&kl=br-pt", wait_until="domcontentloaded")
             await page.fill("input[name=q]", q)
             await page.keyboard.press("Enter")
             await page.wait_for_load_state("domcontentloaded")
-            # Pegar resultados (link real ou /l/?uddg=)
-            anchors = await page.locator("a.result__a, a[href^='/l/']").evaluate_all("els => els.map(e => e.href)")
+            anchors = await page.locator("a.result__a, a[href^='/l/']").evaluate_all(
+                "els => els.map(e => e.href)"
+            )
             for h in anchors:
                 real = decode_ddg(h)
                 try:
                     host = urlparse(real).netloc
                     if host and "duckduckgo.com" not in host and real not in links:
                         links.append(real)
-                except Exception: pass
-            if len(links) >= max_links: break
+                except Exception:
+                    pass
+            if len(links) >= max_links:
+                break
 
-        # Visitar os sites e extrair telefones
+        # Visitar sites e extrair telefones
         for url in links[:max_links]:
             try:
                 p = await context.new_page()
@@ -93,8 +118,10 @@ async def search_and_collect(city: str, segment: str, total: int, headless: bool
                 phones = await extract_phones_from_html(html)
                 title = (await p.title()) or url
                 await p.close()
+
                 for e in phones:
-                    if e in seen: continue
+                    if e in seen:
+                        continue
                     seen.add(e)
                     rows.append({
                         "name": title[:160],
@@ -103,17 +130,24 @@ async def search_and_collect(city: str, segment: str, total: int, headless: bool
                         "address": "",
                         "source": url
                     })
-                    if len(rows) >= total: break
+                    if len(rows) >= total:
+                        break
             except Exception:
+                # Ignora site que deu erro
                 pass
-            if len(rows) >= total: break
+            if len(rows) >= total:
+                break
 
         await context.close()
         await browser.close()
 
+    # Montar CSV sem f-string com backslash na expressão
     header = "name,phone_e164,wa_status,address,source\n"
-    body = "\n".join(f'{r["name"].replace(","," ").replace("\n"," ")},{r["phone_e164"]},unvalidated,,{r["source"]}' for r in rows)
-    csv = header + body + ("\n" if body else "")
+    lines = [
+        f"{csv_escape(r['name'])},{r['phone_e164']},unvalidated,,{csv_escape(r['source'])}"
+        for r in rows
+    ]
+    csv = header + "\n".join(lines) + ("\n" if lines else "")
     return {"ok": True, "query": query_base, "total": len(rows), "rows": rows, "csv": csv}
 
 async def main():
@@ -123,7 +157,9 @@ async def main():
     ap.add_argument("--total", type=int, default=50)
     ap.add_argument("--headful", action="store_true", help="Abrir janela (para testes locais)")
     args = ap.parse_args()
-    data = await search_and_collect(args.city, args.segment, max(1, min(args.total, 200)), headless=not args.headful)
+    data = await search_and_collect(
+        args.city, args.segment, max(1, min(args.total, 200)), headless=not args.headful
+    )
     print(json.dumps(data, ensure_ascii=False))
 
 if __name__ == "__main__":
