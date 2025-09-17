@@ -25,7 +25,10 @@ def to_e164_br(raw: str) -> str | None:
     return None
 
 def decode_ddg(href: str) -> str:
+    """Decodifica links do DuckDuckGo, inclusive o formato relativo /l/?uddg=..."""
     try:
+        if href.startswith("/l/"):
+            href = "https://duckduckgo.com" + href
         u = urlparse(href)
         if "duckduckgo.com" in u.netloc:
             qs = parse_qs(u.query)
@@ -44,12 +47,12 @@ async def extract_phones_from_html(html: str) -> list[str]:
     # wa.me
     for m in re.finditer(r'wa\.me/(\d{10,15})', html, flags=re.I):
         raw = m.group(1)
-        e = to_e164_br("+"+raw if raw.startswith("55") else "+55"+raw)
+        e = to_e164_br(("+" if raw.startswith("55") else "+55") + raw)
         if e: out.add(e)
     # api.whatsapp.com
     for m in re.finditer(r'api\.whatsapp\.com/[^"\']*?[?&]phone=(\d{10,15})', html, flags=re.I):
         raw = m.group(1)
-        e = to_e164_br("+"+raw if raw.startswith("55") else "+55"+raw)
+        e = to_e164_br(("+" if raw.startswith("55") else "+55") + raw)
         if e: out.add(e)
     # texto
     for m in PHONE_RE.finditer(html):
@@ -58,7 +61,6 @@ async def extract_phones_from_html(html: str) -> list[str]:
     return sorted(out)
 
 def csv_escape(val: str) -> str:
-    """Escapa adequadamente para CSV (aspas duplas, vírgula e quebras de linha)."""
     s = (val or "")
     if any(ch in s for ch in [',', '"', '\n']):
         s = '"' + s.replace('"', '""') + '"'
@@ -72,33 +74,39 @@ async def search_and_collect(city: str, segment: str, total: int, headless: bool
     max_links = max(20, min(total * 5, 80))
 
     async with async_playwright() as pw:
-        # FLAGS importantes para Railway:
-        #  - no sandbox (roda como root)
-        #  - não usa /dev/shm (pequeno em container)
-        #  - desativa GPU
+        # FLAGS necessárias para rodar no Railway
         browser = await pw.chromium.launch(
             headless=headless,
             args=[
                 "--no-sandbox",
                 "--disable-setuid-sandbox",
                 "--disable-dev-shm-usage",
-                "--disable-gpu"
-            ]
+                "--disable-gpu",
+            ],
         )
         context = await browser.new_context(user_agent=UA, locale="pt-BR")
         page = await context.new_page()
 
-        # Buscar links no DuckDuckGo
         links: list[str] = []
         for q in queries:
             await page.goto("https://duckduckgo.com/?ia=web&kl=br-pt", wait_until="domcontentloaded")
             await page.fill("input[name=q]", q)
             await page.keyboard.press("Enter")
-            await page.wait_for_load_state("domcontentloaded")
-            anchors = await page.locator("a.result__a, a[href^='/l/']").evaluate_all(
-                "els => els.map(e => e.href)"
+            # Espera aparecer qualquer link na página
+            try:
+                await page.wait_for_selector("a[href]", timeout=15000)
+            except Exception:
+                pass
+
+            # Coleta TODOS os hrefs para evitar depender de classes que mudam
+            hrefs = await page.evaluate(
+                "() => Array.from(document.querySelectorAll('a'))"
+                ".map(a => a.getAttribute('href') || a.href || '')"
+                ".filter(Boolean)"
             )
-            for h in anchors:
+
+            # Normaliza / decodifica
+            for h in hrefs:
                 real = decode_ddg(h)
                 try:
                     host = urlparse(real).netloc
@@ -133,7 +141,6 @@ async def search_and_collect(city: str, segment: str, total: int, headless: bool
                     if len(rows) >= total:
                         break
             except Exception:
-                # Ignora site que deu erro
                 pass
             if len(rows) >= total:
                 break
@@ -141,7 +148,6 @@ async def search_and_collect(city: str, segment: str, total: int, headless: bool
         await context.close()
         await browser.close()
 
-    # Montar CSV sem f-string com backslash na expressão
     header = "name,phone_e164,wa_status,address,source\n"
     lines = [
         f"{csv_escape(r['name'])},{r['phone_e164']},unvalidated,,{csv_escape(r['source'])}"
