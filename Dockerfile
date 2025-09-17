@@ -8,7 +8,7 @@ WORKDIR /app
 
 # Node deps
 COPY package*.json ./
-RUN npm ci --omit=dev
+RUN npm install --omit=dev
 
 # Código
 COPY . .
