@@ -50,7 +50,7 @@ app.get('/api/status', (_, res) => {
   res.json({
     ok: true,
     validationProvider: 'CLICK2CHAT (on-demand)',
-    searchMode: 'Python (DuckDuckGo HTML + raspagem de sites)',
+    searchMode: 'Python Playwright (DuckDuckGo + raspagem sites, headless)',
     ts: Date.now()
   });
 });
@@ -104,7 +104,8 @@ app.post('/api/validate', async (req, res) => {
 });
 
 // >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-// NOVO /api/run: chama o scraper Python (NÃO usa Puppeteer)
+// /api/run: chama o scraper Python com Playwright (abre navegador headless)
+// Para ver janela localmente, defina PLAYWRIGHT_HEADFUL=1 no seu .env
 // >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
 app.post('/api/run', async (req, res) => {
   const { city, segment, total } = req.body || {};
@@ -114,11 +115,15 @@ app.post('/api/run', async (req, res) => {
 
   try {
     const args = [
-      'scraper/scrape.py',
+      'scraper/browser_scrape.py',
       '--city', city,
       '--segment', segment || '',
       '--total', String(Math.min(Number(total || 50), 200))
     ];
+    if (process.env.PLAYWRIGHT_HEADFUL === '1') {
+      args.push('--headful'); // útil para DEV local (não usar no Railway)
+    }
+
     const p = spawn('python3', args, { stdio: ['ignore', 'pipe', 'pipe'] });
 
     let out = '', err = '';
@@ -127,12 +132,10 @@ app.post('/api/run', async (req, res) => {
 
     p.on('close', code => {
       if (code !== 0) {
-        // Se o script falhar, devolvemos erro e um trecho do stderr para debug
         return res.status(500).json({ error: `scraper exit ${code}`, stderr: (err || '').slice(0, 800) });
       }
       try {
         const data = JSON.parse(out);
-        // Garante wa_status no retorno
         const rows = (data.rows || []).map(r => ({ ...r, wa_status: r.wa_status || 'unvalidated' }));
         res.json({
           ok: true,
@@ -150,7 +153,7 @@ app.post('/api/run', async (req, res) => {
   }
 });
 
-// Utilidade p/ CSV (aqui não usamos porque o CSV já vem do Python, mas deixei caso precise)
+// Utilidade p/ CSV (se precisar montar CSV no Node)
 function csvEscape(v) {
   const s = (v ?? '').toString();
   return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
