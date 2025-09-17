@@ -8,14 +8,14 @@ WORKDIR /app
 
 # Node deps
 COPY package*.json ./
-RUN npm install --omit=dev
+RUN npm install --omit=dev   # já que você não tem package-lock.json
 
 # Código
 COPY . .
 
 # Python deps
 RUN pip3 install --no-cache-dir -r scraper/requirements.txt
-# Instala o Chromium usado pelo Playwright (Python)
+# Instala Chromium para o Playwright
 RUN python3 -m playwright install --with-deps chromium
 
 ENV NODE_ENV=production
