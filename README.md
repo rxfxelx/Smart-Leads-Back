@@ -1,84 +1,59 @@
-# Lead Finder + Validador de WhatsApp (CSV)
+# Smart Leads (Python) – Busca + Validação WhatsApp (automática)
 
-Aplicativo web simples que:
+**Stack:** FastAPI + Playwright (Chromium headless) + httpx + phonenumbers.  
+**Fluxo:** Busca links (DuckDuckGo HTML), navega nos sites, raspa telefones, normaliza E.164, **valida automaticamente** no WhatsApp (UAZAPI / WHAPI / Click2Chat) e permite baixar CSV.
 
-1. Busca telefones de empresas por **cidade/região** usando **Google Places API** (opcional).
-2. **Valida** se os números possuem **WhatsApp** (via **WHAPI** – exemplo plugável).
-3. Entrega a lista em **CSV** para download.
+## Variáveis de Ambiente
+| Nome | Exemplo | Observação |
+|---|---|---|
+| `CORS_ANY` | `1` | Libera CORS para qualquer origem (teste). |
+| `CORS_ORIGINS` | `https://meufront.com` | Use no lugar de `CORS_ANY` em produção. |
+| `VALIDATION_PROVIDER` | `UAZAPI` \| `WHAPI` \| `CLICK2CHAT` | Provedor de verificação. |
+| `PLAYWRIGHT_HEADFUL` | `0` | Em Railway mantenha `0` (headless). |
 
-> **Atenção legal (LGPD/Termos):** Use somente dados coletados com base legal e com finalidade compatível.
-> Checar números sem consentimento e disparar mensagens não solicitadas pode violar a **LGPD** no Brasil e os **Termos** de plataformas como Google e WhatsApp.
-> Adapte o fluxo ao seu caso de uso, com **opt-in** e transparência. Consulte seu jurídico.
+### UAZAPI
+| Nome | Exemplo |
+|---|---|
+| `UAZ_BASE_URL` | `https://seu-servidor.uazapi.dev` |
+| `UAZ_INSTANCE` | `minhaInstancia` |
+| `UAZ_API_KEY` | `seu_api_key` |
+| `UAZ_VERIFY_PATH` | `/contacts/check` (ajuste conforme docs) |
 
----
+> Pelo material público da UAZ (Postman), o **header de autenticação** é `apikey` e as rotas costumam incluir o **nome da instância** na URL; veja o Postman público “uazapi - WhatsApp API (v1.0)”. citeturn1view0
 
-## Como rodar
+### WHAPI (opcional/exemplo)
+| Nome | Exemplo |
+|---|---|
+| `WHAPI_BASE_URL` | `https://api.whapi.cloud` |
+| `WHAPI_TOKEN` | `Bearer xxxxx` |
 
+## Rodar local
 ```bash
-# 1) Entre na pasta
-cd lead-finder-whatsapp
-
-# 2) Instale dependências
-npm install
-
-# 3) Configure variáveis
-cp .env.example .env
-# edite .env: PLACES_API_KEY, VALIDATION_PROVIDER, WHAPI_TOKEN...
-
-# 4) Suba o servidor
-npm start
-# Acesse http://localhost:5173
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+python -m playwright install --with-deps chromium
+uvicorn app.main:app --reload
 ```
+Abra: http://localhost:8000
 
----
+## Deploy (Railway)
+- Conecte o repositório e use o `Dockerfile` incluso.
+- Defina as **Variables** (acima).
+- A aplicação sobe em `:8000`.
 
-## Provedores de validação suportados
+## Como o verificador UAZ funciona aqui
+O arquivo `app/verify.py` tem a função `verify_uazapi` com um **adaptador flexível**:
+1. Tenta `POST {UAZ_BASE_URL}{UAZ_VERIFY_PATH}/{UAZ_INSTANCE}` com body `{"phones": ["+55..."]}`.  
+2. Se faltar algo, tenta `POST {UAZ_BASE_URL}{UAZ_VERIFY_PATH}` com body `{"instance":"...", "phones":[...]}`.  
+3. Entende respostas comuns como:
+   - `{"results":[{"phone":"+55...","exists":true}]}`  
+   - `{"data":[{"phone":"+55...","is_whatsapp":true}]}`  
+   - `{"success":true,"status":"valid"}` (consulta unitária)  
 
-- `WHAPI` – usa `POST /contacts` com `blocking=wait` para checar status em lote.
-- `NONE` – não valida, apenas formata e exporta.
+> Ajuste `UAZ_VERIFY_PATH` conforme a rota real da sua instância (o Postman público indica que as requisições usam **apikey** e **instância** na URL). citeturn1view0
 
-> **Meta WhatsApp Cloud API** atualmente **não expõe endpoint oficial** para verificar se um número é do WhatsApp sem tentar enviar mensagem.
-> Alternativas oficiais envolvem fluxos de **opt-in** e/ou envio de **mensagem de template** (pode gerar custo e notificar o contato).
-
-Para usar outro provedor (ex.: sua **uazapi**, 2Chat, Z-API etc), abra `server/src/whatsapp.js` e implemente uma função de validação que retorne
-`[{ input: "+55...", status: "valid"|"invalid"|"unknown", wa_id: "55..."|null }]`.
-
----
-
-## Fontes de contatos
-
-A aba “Buscar por Cidade/Região” usa Google Places (Text Search + Place Details) para obter telefones públicos de estabelecimentos.
-Dependendo do **uso** (ex.: criação de listas de marketing), isso **pode violar** termos do Google. Avalie usar fontes **opt-in** e bases **contratadas**.
-
----
-
-## CSV
-
-O CSV contém: `name,phone_e164,wa_status,address,source`.
-
----
-
-## Estrutura
-
-```
-lead-finder-whatsapp/
-├─ package.json
-├─ .env.example
-├─ README.md
-├─ public/
-│  ├─ index.html
-│  └─ app.js
-└─ server/
-   └─ src/
-      ├─ server.js
-      ├─ google.js
-      ├─ phone.js
-      └─ whatsapp.js
-```
-
----
-
-## Observações de quota/limites
-
-- Google Places **Text Search** e **Place Details** possuem cotas e **custos**. Faça cache e use filtros.
-- A validação por provedores terceiros pode ter **limites** e **custos**. Lotes de até 100 contatos são recomendados.
+## Avisos
+- Scraping depende de como os sites expõem telefones; resultados variam por segmento/cidade.
+- Mantenha `total` moderado em hospedagens com pouca RAM/CPU.
+- O modo **Click2Chat** é heurístico (sem garantias). Para produção, use seu provedor oficial (ex.: UAZAPI).
