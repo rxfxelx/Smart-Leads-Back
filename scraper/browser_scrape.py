@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 import asyncio, argparse, json, re
-from urllib.parse import urlparse, parse_qs, unquote
-from bs4 import BeautifulSoup
+from urllib.parse import urlparse, parse_qs, unquote, quote_plus
 from playwright.async_api import async_playwright
 import phonenumbers as pn
 
@@ -25,14 +24,20 @@ def to_e164_br(raw: str) -> str | None:
     return None
 
 def decode_ddg(href: str) -> str:
-    """Decodifica links do DuckDuckGo, inclusive o formato relativo /l/?uddg=..."""
+    """
+    Decodifica links do DuckDuckGo:
+      - /l/?uddg=<url>
+      - /r?uddg=<url>
+      - https://duckduckgo.com/l/?uddg=...
+      - https://duckduckgo.com/r?uddg=...
+    """
     try:
-        if href.startswith("/l/"):
+        if href.startswith("/l/") or href.startswith("/r?"):
             href = "https://duckduckgo.com" + href
         u = urlparse(href)
         if "duckduckgo.com" in u.netloc:
             qs = parse_qs(u.query)
-            if "uddg" in qs:
+            if "uddg" in qs and qs["uddg"]:
                 return unquote(qs["uddg"][0])
     except Exception:
         pass
@@ -40,24 +45,14 @@ def decode_ddg(href: str) -> str:
 
 async def extract_phones_from_html(html: str) -> list[str]:
     out = set()
-    # tel:
     for m in re.finditer(r'href=["\']tel:([^"\']+)["\']', html, flags=re.I):
-        e = to_e164_br(m.group(1))
-        if e: out.add(e)
-    # wa.me
+        e = to_e164_br(m.group(1));  out.add(e) if e else None
     for m in re.finditer(r'wa\.me/(\d{10,15})', html, flags=re.I):
-        raw = m.group(1)
-        e = to_e164_br(("+" if raw.startswith("55") else "+55") + raw)
-        if e: out.add(e)
-    # api.whatsapp.com
+        raw = m.group(1); e = to_e164_br(("+" if raw.startswith("55") else "+55") + raw); out.add(e) if e else None
     for m in re.finditer(r'api\.whatsapp\.com/[^"\']*?[?&]phone=(\d{10,15})', html, flags=re.I):
-        raw = m.group(1)
-        e = to_e164_br(("+" if raw.startswith("55") else "+55") + raw)
-        if e: out.add(e)
-    # texto
+        raw = m.group(1); e = to_e164_br(("+" if raw.startswith("55") else "+55") + raw); out.add(e) if e else None
     for m in PHONE_RE.finditer(html):
-        e = to_e164_br(m.group(0))
-        if e: out.add(e)
+        e = to_e164_br(m.group(0)); out.add(e) if e else None
     return sorted(out)
 
 def csv_escape(val: str) -> str:
@@ -66,15 +61,43 @@ def csv_escape(val: str) -> str:
         s = '"' + s.replace('"', '""') + '"'
     return s
 
+async def collect_ddg_links(page, query: str, max_links: int) -> list[str]:
+    # Usamos a versão HTML “lite” (estável para scraping)
+    url = f"https://duckduckgo.com/html/?q={quote_plus(query)}&kl=br-pt&ia=web"
+    await page.goto(url, wait_until="domcontentloaded", timeout=45000)
+    # Coleta todos os <a href> e decodifica os que são de redirecionamento
+    hrefs = await page.evaluate(
+        "() => Array.from(document.querySelectorAll('a[href]'))"
+        ".map(a => a.getAttribute('href'))"
+    )
+    links = []
+    for h in hrefs:
+        if not h: 
+            continue
+        real = decode_ddg(h)
+        try:
+            host = urlparse(real).netloc
+            if host and "duckduckgo.com" not in host and real not in links:
+                links.append(real)
+        except Exception:
+            pass
+        if len(links) >= max_links:
+            break
+    return links
+
 async def search_and_collect(city: str, segment: str, total: int, headless: bool = True) -> dict:
     query_base = f"{segment or 'empresas'} {city}"
-    queries = [f"{query_base} telefone", f"{query_base} contato"]
+    # reforça sinais que costumam aparecer junto de telefone
+    queries = [
+        f"{query_base} telefone",
+        f"{query_base} contato",
+        f"{query_base} whatsapp"
+    ]
 
     rows, seen = [], set()
     max_links = max(20, min(total * 5, 80))
 
     async with async_playwright() as pw:
-        # FLAGS necessárias para rodar no Railway
         browser = await pw.chromium.launch(
             headless=headless,
             args=[
@@ -87,38 +110,21 @@ async def search_and_collect(city: str, segment: str, total: int, headless: bool
         context = await browser.new_context(user_agent=UA, locale="pt-BR")
         page = await context.new_page()
 
-        links: list[str] = []
+        # 1) Junta os links das consultas
+        all_links: list[str] = []
         for q in queries:
-            await page.goto("https://duckduckgo.com/?ia=web&kl=br-pt", wait_until="domcontentloaded")
-            await page.fill("input[name=q]", q)
-            await page.keyboard.press("Enter")
-            # Espera aparecer qualquer link na página
             try:
-                await page.wait_for_selector("a[href]", timeout=15000)
+                ls = await collect_ddg_links(page, q, max_links)
+                for u in ls:
+                    if u not in all_links:
+                        all_links.append(u)
+                if len(all_links) >= max_links:
+                    break
             except Exception:
                 pass
 
-            # Coleta TODOS os hrefs para evitar depender de classes que mudam
-            hrefs = await page.evaluate(
-                "() => Array.from(document.querySelectorAll('a'))"
-                ".map(a => a.getAttribute('href') || a.href || '')"
-                ".filter(Boolean)"
-            )
-
-            # Normaliza / decodifica
-            for h in hrefs:
-                real = decode_ddg(h)
-                try:
-                    host = urlparse(real).netloc
-                    if host and "duckduckgo.com" not in host and real not in links:
-                        links.append(real)
-                except Exception:
-                    pass
-            if len(links) >= max_links:
-                break
-
-        # Visitar sites e extrair telefones
-        for url in links[:max_links]:
+        # 2) Visita os sites e extrai telefones
+        for url in all_links[:max_links]:
             try:
                 p = await context.new_page()
                 await p.goto(url, wait_until="domcontentloaded", timeout=45000)
